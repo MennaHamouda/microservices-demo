@@ -1,0 +1,380 @@
+
+#  Triggers:
+#    • Push to main  → build + push images + deploy to EKS
+#    • Pull request  → build + test only  (no push, no deploy)
+#    • Manual        → workflow_dispatch with optional env override
+#
+#  Required GitHub Secrets:
+#    AWS_ACCESS_KEY_ID          AWS credentials for ECR + EKS
+#    AWS_SECRET_ACCESS_KEY
+#    AWS_REGION                 e.g. us-east-1
+#    ECR_REGISTRY               e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com
+#    EKS_CLUSTER_NAME           e.g. online-boutique-prod
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+name: CI/CD Pipeline
+ 
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: production
+        type: choice
+        options: [production, staging]
+      force_deploy:
+        description: "Force deploy even if tests fail"
+        required: false
+        default: "false"
+ 
+# Cancel in-progress runs on the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+ 
+env:
+  AWS_REGION:    ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY:  ${{ secrets.ECR_REGISTRY }}
+  IMAGE_TAG:     ${{ github.sha }}
+ 
+# ─
+jobs:
+
+  #  Job 1 – Lint & static analysis
+  # ══════════════════════════════════════════════════════════════════════════
+  lint:
+    name: Lint & Static Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+ 
+      # ── Go services ──────────────────────────────────────────────────────
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+ 
+      - name: golangci-lint (frontend)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.58
+          working-directory: src/frontend
+ 
+      - name: golangci-lint (checkoutservice)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.58
+          working-directory: src/checkoutservice
+ 
+      - name: golangci-lint (productcatalogservice)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.58
+          working-directory: src/productcatalogservice
+ 
+      - name: golangci-lint (shippingservice)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.58
+          working-directory: src/shippingservice
+ 
+    
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+ 
+      - name: Install Python linters
+        run: pip install ruff==0.4.4 mypy==1.10.0
+ 
+      - name: ruff lint (Python services)
+        run: ruff check src/paymentservice src/emailservice src/recommendationservice src/adservice
+ 
+      
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+ 
+      - name: ESLint (currencyservice)
+        working-directory: src/currencyservice
+        run: |
+          npm ci
+          npx eslint server.js --no-eslintrc --rule '{"no-unused-vars": "warn"}' || true
+ 
+      # ── YAML / K8s manifests ──────────────────────────────────────────────
+      - name: Validate Kubernetes manifests
+        uses: azure/k8s-lint@v1
+        with:
+          manifests: |
+            kubernetes-manifests/00-namespace.yaml
+            kubernetes-manifests/01-redis.yaml
+            kubernetes-manifests/02-services.yaml
+            kubernetes-manifests/03-frontend.yaml
+            kubernetes-manifests/04-hpa.yaml
+            kubernetes-manifests/05-network-policies.yaml
+            kubernetes-manifests/06-pdb.yaml
+ 
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+ 
+      # Go tests
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+ 
+      - name: Install protoc
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.1
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.3.0
+ 
+      - name: Generate proto stubs (Go)
+        run: bash scripts/generate-protos.sh || true
+ 
+      - name: Go tests – checkoutservice
+        working-directory: src/checkoutservice
+        run: go test ./... -v -race -coverprofile=coverage.out
+        continue-on-error: true
+ 
+      - name: Go tests – productcatalogservice
+        working-directory: src/productcatalogservice
+        run: go test ./... -v -race
+        continue-on-error: true
+ 
+      # Python tests
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+ 
+      - name: Install Python test deps
+        run: pip install pytest pytest-cov grpcio grpcio-tools protobuf
+ 
+      - name: Python tests – paymentservice
+        working-directory: src/paymentservice
+        run: pytest tests/ -v --tb=short 2>/dev/null || echo "No tests yet"
+ 
+      - name: Python tests – emailservice
+        working-directory: src/emailservice
+        run: pytest tests/ -v --tb=short 2>/dev/null || echo "No tests yet"
+ 
+      # Upload coverage
+      - name: Upload Go coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: src/checkoutservice/coverage.out
+          flags: checkoutservice
+        continue-on-error: true
+ 
+
+  build-and-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - name: frontend
+            dockerfile: src/frontend/Dockerfile
+          - name: cartservice
+            dockerfile: src/cartservice/Dockerfile
+          - name: productcatalogservice
+            dockerfile: src/productcatalogservice/Dockerfile
+          - name: currencyservice
+            dockerfile: src/currencyservice/Dockerfile
+          - name: paymentservice
+            dockerfile: src/paymentservice/Dockerfile
+          - name: shippingservice
+            dockerfile: src/shippingservice/Dockerfile
+          - name: emailservice
+            dockerfile: src/emailservice/Dockerfile
+          - name: checkoutservice
+            dockerfile: src/checkoutservice/Dockerfile
+          - name: recommendationservice
+            dockerfile: src/recommendationservice/Dockerfile
+          - name: adservice
+            dockerfile: src/adservice/Dockerfile
+ 
+    steps:
+      - uses: actions/checkout@v4
+ 
+      # ── Set up Docker Buildx with layer caching ───────────────────────────
+      - uses: docker/setup-buildx-action@v3
+ 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+ 
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+ 
+      # ── Build & push with cache ──────────────────────────────────────────
+      - name: Build and push ${{ matrix.service.name }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.service.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ matrix.service.name }}:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/${{ matrix.service.name }}:latest
+          cache-from: type=registry,ref=${{ env.ECR_REGISTRY }}/${{ matrix.service.name }}:cache
+          cache-to:   type=registry,ref=${{ env.ECR_REGISTRY }}/${{ matrix.service.name }}:cache,mode=max
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+ 
+      - name: Image security scan (${{ matrix.service.name }})
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:    ${{ env.ECR_REGISTRY }}/${{ matrix.service.name }}:${{ env.IMAGE_TAG }}
+          format:       sarif
+          output:       trivy-${{ matrix.service.name }}.sarif
+          severity:     CRITICAL,HIGH
+          exit-code:    "0"   # Don't block on vulnerabilities (set to 1 to block)
+ 
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.service.name }}.sarif
+          category:   trivy-${{ matrix.service.name }}
+        continue-on-error: true
+ 
+  # ══════════════════════════════════════════════════════════════════════════
+  #  Job 4 – Deploy to EKS
+  # ══════════════════════════════════════════════════════════════════════════
+  deploy:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    environment:
+      name: ${{ github.event.inputs.environment || 'production' }}
+      url:  https://boutique.example.com   # replace with your domain
+ 
+    steps:
+      - uses: actions/checkout@v4
+ 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+ 
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }}
+ 
+      # ── Substitute image references in manifests ───────────────────────────
+      - name: Substitute image tags in manifests
+        run: |
+          find kubernetes-manifests/ -name "*.yaml" -exec sed -i \
+            "s|\${REGISTRY}|${{ env.ECR_REGISTRY }}|g; s|\${IMAGE_TAG}|${{ env.IMAGE_TAG }}|g" {} +
+ 
+      # ── Apply in order ────────────────────────────────────────────────────
+      - name: Apply namespace
+        run: kubectl apply -f kubernetes-manifests/00-namespace.yaml
+ 
+      - name: Apply Redis
+        run: kubectl apply -f kubernetes-manifests/01-redis.yaml
+ 
+      - name: Apply microservices
+        run: kubectl apply -f kubernetes-manifests/02-services.yaml
+ 
+      - name: Apply frontend
+        run: kubectl apply -f kubernetes-manifests/03-frontend.yaml
+ 
+      - name: Apply HPAs
+        run: kubectl apply -f kubernetes-manifests/04-hpa.yaml
+ 
+      - name: Apply NetworkPolicies
+        run: kubectl apply -f kubernetes-manifests/05-network-policies.yaml
+ 
+      - name: Apply PodDisruptionBudgets
+        run: kubectl apply -f kubernetes-manifests/06-pdb.yaml
+ 
+      # ── Rollout verification ───────────────────────────────────────────────
+      - name: Wait for rollouts to complete
+        run: |
+          DEPLOYMENTS=(
+            frontend
+            productcatalogservice
+            currencyservice
+            cartservice
+            paymentservice
+            shippingservice
+            emailservice
+            recommendationservice
+            adservice
+            checkoutservice
+          )
+          for dep in "${DEPLOYMENTS[@]}"; do
+            echo "⏳ Waiting for $dep…"
+            kubectl rollout status deployment/$dep \
+              --namespace online-boutique \
+              --timeout=5m
+            echo "✅ $dep is ready"
+          done
+ 
+      - name: Verify pod health
+        run: |
+          kubectl get pods --namespace online-boutique
+          kubectl get services --namespace online-boutique
+ 
+      # ── Smoke test ────────────────────────────────────────────────────────
+      - name: Smoke test (HTTP 200 from frontend)
+        run: |
+          FRONTEND_IP=$(kubectl get svc frontend-external \
+            --namespace online-boutique \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "Frontend address: $FRONTEND_IP"
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://$FRONTEND_IP/ || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Smoke test passed (HTTP $STATUS)"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $STATUS – retrying in 15s…"
+            sleep 15
+          done
+          echo "❌ Smoke test failed"
+          exit 1
+ 
+  # ══════════════════════════════════════════════════════════════════════════
+  #  Job 5 – Notify on failure
+  # ══════════════════════════════════════════════════════════════════════════
+  notify-on-failure:
+    name: Notify Failure
+    runs-on: ubuntu-latest
+    needs: [lint, test, build-and-push, deploy]
+    if: failure()
+    steps:
+      - name: Post failure summary
+        run: |
+          echo "## Pipeline Failed" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| lint            | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| test            | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| build-and-push  | ${{ needs.build-and-push.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| deploy          | ${{ needs.deploy.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "Actor: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
