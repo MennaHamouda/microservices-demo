@@ -1,7 +1,7 @@
  # microservices-demo
 
 
-#<!-- <p align="center">
+# <p align="center">
 <img src="/src/frontend/static/icons/Hipster_HeroLogoMaroon.svg" width="300" alt="Online Boutique" />
 </p> -->
 ![Continuous Integration](https://github.com/GoogleCloudPlatform/microservices-demo/workflows/Continuous%20Integration%20-%20Main/Release/badge.svg)
@@ -54,7 +54,7 @@ Find **Protocol Buffers Descriptions** at the [`./protos` directory](/protos).
 2. Clone the latest major version.
 
    ```sh
-   git clone --depth 1 --branch v0 https://github.com/GoogleCloudPlatform/microservices-demo.git
+   git clone --depth 1 --branch v0 https://github.com/MennaHamouda/microservices-demo
    cd microservices-demo/
    ```
 
